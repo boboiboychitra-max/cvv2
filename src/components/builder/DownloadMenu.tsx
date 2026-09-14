@@ -28,6 +28,11 @@ export const DownloadMenu: React.FC<DownloadMenuProps> = ({
   const handleDownloadDirectPdf = async () => {
     setIsGeneratingPdf(true);
     setFailed(false);
+    // Let React actually paint the "Generating PDF..." spinner before the
+    // heavy synchronous capture work begins — without this yield, the state
+    // update and the capture can get batched into the same frame, so the
+    // button just looks frozen for a moment instead of showing progress.
+    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
     try {
       const result = await downloadDirectPdf(data, templateId, primaryColor);
       if (result.success) {
