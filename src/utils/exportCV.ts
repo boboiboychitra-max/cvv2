@@ -10,6 +10,21 @@ const BLANK_PIXEL =
   'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=';
 
 /**
+ * Same-origin resources (e.g. the app's own logo, or a photo already inlined
+ * as a data: URI) can never taint the canvas, so there's no need to pay the
+ * cost of re-fetching and base64-re-encoding them before every export. Only
+ * genuinely cross-origin URLs need that treatment.
+ */
+function isSameOriginOrInline(src: string): boolean {
+  if (!src || src.startsWith('data:') || src.startsWith('blob:')) return true;
+  try {
+    return new URL(src, document.baseURI).origin === window.location.origin;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Cross-origin <img> tags (e.g. sample avatar photos hosted on a third-party domain)
  * taint the canvas: even though html-to-image can often still *draw* them, any later
  * read of pixel data (toDataURL / getImageData) throws a SecurityError and silently
@@ -25,7 +40,7 @@ async function neutralizeCrossOriginImages(root: HTMLElement): Promise<() => voi
   await Promise.all(
     imgs.map(async (img) => {
       const src = img.getAttribute('src') || '';
-      if (!src || src.startsWith('data:')) return;
+      if (isSameOriginOrInline(src)) return; // can't taint the canvas — skip the fetch/re-encode entirely
 
       originals.push({ el: img, src });
 
@@ -77,6 +92,8 @@ async function neutralizeCrossOriginBackgrounds(root: HTMLElement): Promise<() =
       if (!match) return;
 
       const src = match[2];
+      if (isSameOriginOrInline(src)) return; // can't taint the canvas — skip it
+
       originals.push({ el, style: el.style.backgroundImage });
 
       try {
