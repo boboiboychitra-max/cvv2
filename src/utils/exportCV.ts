@@ -146,181 +146,213 @@ async function captureWithAllImagesStripped(
 }
 
 /**
+ * Slices a captured canvas into A4 pages and saves it as a PDF. Pulled out so
+ * it can be run twice: once against the normally-captured canvas, and again
+ * against a fully-stripped fallback canvas if the first pass turns out to be
+ * tainted (see downloadDirectPdf for why toCanvas() succeeding doesn't
+ * guarantee the canvas is actually safe to read from).
+ */
+function buildPdfFromCanvas(sourceCanvas: HTMLCanvasElement, fileName: string): void {
+  const pdf = new jsPDF({
+    orientation: 'portrait',
+    unit: 'mm',
+    format: 'a4',
+  });
+
+  const pdfPageWidth = 210;
+  const pdfPageHeight = 297;
+  const totalWidthPx = sourceCanvas.width;
+  const totalHeightPx = sourceCanvas.height;
+  const pxPerMm = totalWidthPx / pdfPageWidth;
+  const pageHeightPx = pdfPageHeight * pxPerMm;
+  const imgWidth = pdfPageWidth;
+
+  if (totalHeightPx <= pageHeightPx) {
+    // Fits on a single page — no cut needed. toDataURL() here is the first
+    // point a taint would actually surface as a thrown SecurityError.
+    const dataUrl = sourceCanvas.toDataURL('image/png');
+    const imgHeight = totalHeightPx / pxPerMm;
+    pdf.addImage(dataUrl, 'PNG', 0, 0, imgWidth, imgHeight, undefined, 'FAST');
+    pdf.save(fileName);
+    return;
+  }
+
+  const ctx = sourceCanvas.getContext('2d');
+  if (!ctx) throw new Error('Could not read canvas context');
+  // getImageData() is the other point a taint surfaces as a thrown SecurityError.
+  const imageData = ctx.getImageData(0, 0, totalWidthPx, totalHeightPx).data;
+
+  // A row counts as "safe to cut" if it's essentially blank (close to white),
+  // sampled sparsely across the width for speed.
+  const isRowBlank = (y: number): boolean => {
+    const rowStart = y * totalWidthPx * 4;
+    for (let x = 0; x < totalWidthPx; x += 8) {
+      const i = rowStart + x * 4;
+      const r = imageData[i], g = imageData[i + 1], b = imageData[i + 2];
+      if (r < 245 || g < 245 || b < 245) return false;
+    }
+    return true;
+  };
+
+  // Search up to ~12mm above the ideal cut line for a blank row, so we never
+  // slice through the middle of a line of text or a bullet point.
+  const maxSearchPx = 12 * pxPerMm;
+  const findCutY = (idealY: number): number => {
+    for (let dy = 0; dy <= maxSearchPx; dy++) {
+      const candidate = Math.round(idealY - dy);
+      if (candidate <= 0) break;
+      if (isRowBlank(candidate)) return candidate;
+    }
+    return Math.round(idealY); // fallback: hard cut if no whitespace found
+  };
+
+  const cutPoints: number[] = [0];
+  let cursor = 0;
+  while (totalHeightPx - cursor > pageHeightPx) {
+    const idealCut = cursor + pageHeightPx;
+    const cutY = findCutY(idealCut);
+    cutPoints.push(cutY > cursor ? cutY : Math.round(idealCut));
+    cursor = cutPoints[cutPoints.length - 1];
+  }
+  cutPoints.push(totalHeightPx);
+
+  const pageCanvas = document.createElement('canvas');
+  const pageCtx = pageCanvas.getContext('2d');
+  if (!pageCtx) throw new Error('Could not create page canvas context');
+
+  for (let p = 0; p < cutPoints.length - 1; p++) {
+    const sliceStart = cutPoints[p];
+    const sliceHeightPx = cutPoints[p + 1] - sliceStart;
+    pageCanvas.width = totalWidthPx;
+    pageCanvas.height = sliceHeightPx;
+    pageCtx.clearRect(0, 0, totalWidthPx, sliceHeightPx);
+    pageCtx.drawImage(
+      sourceCanvas,
+      0, sliceStart, totalWidthPx, sliceHeightPx,
+      0, 0, totalWidthPx, sliceHeightPx
+    );
+    const pageDataUrl = pageCanvas.toDataURL('image/png');
+    const sliceHeightMm = sliceHeightPx / pxPerMm;
+
+    if (p > 0) pdf.addPage();
+    pdf.addImage(pageDataUrl, 'PNG', 0, 0, imgWidth, sliceHeightMm, undefined, 'FAST');
+  }
+
+  pdf.save(fileName);
+}
+
+/**
  * Downloads a high-resolution, pixel-perfect PDF file (.pdf)
  * by capturing the rendered CV template with html-to-image (supports OKLCH and modern CSS) and assembling via jsPDF.
+ *
+ * Returns an object rather than a bare boolean so the caller can show the
+ * user (and future debugging sessions) the actual reason for a failure
+ * instead of a generic "please try again" with no detail anywhere.
  */
 export async function downloadDirectPdf(
   data: CVData,
   templateId: TemplateId | string = 'template-ats-classic',
   primaryColor: string = '#1e3a5f',
   elementSelector: string = '.cv-document-sheet'
-): Promise<boolean> {
+): Promise<{ success: boolean; error?: string }> {
   const cleanName = (data.personal?.fullName || 'Resume').trim().replace(/\s+/g, '_');
   const fileName = `${cleanName}_CV.pdf`;
 
   const sheetElement = document.querySelector(elementSelector) as HTMLElement | null;
 
-  if (sheetElement) {
-    // Save previous styles
-    const originalTransform = sheetElement.style.transform;
-    const originalTransformOrigin = sheetElement.style.transformOrigin;
-    let restoreImages: (() => void) | null = null;
-    let restoreBackgrounds: (() => void) | null = null;
-
-    try {
-      restoreImages = await neutralizeCrossOriginImages(sheetElement);
-      restoreBackgrounds = await neutralizeCrossOriginBackgrounds(sheetElement);
-
-      // Temporarily remove CSS zoom/scale transform so canvas captures unscaled 100% dimensions
-      sheetElement.style.transform = 'none';
-      sheetElement.style.transformOrigin = 'top left';
-
-
-      // Capture at high pixelRatio for crisp typography. We use toCanvas (not toPng)
-      // because we need raw pixel access to find safe places to cut between pages.
-      // Try a few progressively safer capture strategies: full-quality first (embeds
-      // Google Fonts + images), then a version that skips font embedding (common source
-      // of failures when the font CDN can't be reached), then a lower-resolution pass.
-      // This means a single flaky image/font never blocks the whole download.
-      let sourceCanvas: HTMLCanvasElement | null = null;
-      let lastCaptureErr: unknown = null;
-      const captureAttempts: Parameters<typeof htmlToImage.toCanvas>[1][] = [
-        { pixelRatio: 2, backgroundColor: '#ffffff', cacheBust: true },
-        { pixelRatio: 2, backgroundColor: '#ffffff', cacheBust: true, skipFonts: true, imagePlaceholder: '', onImageErrorHandler: () => {} },
-        { pixelRatio: 1, backgroundColor: '#ffffff', cacheBust: true, skipFonts: true, imagePlaceholder: '', onImageErrorHandler: () => {} },
-      ];
-
-      for (const attemptOptions of captureAttempts) {
-        try {
-          sourceCanvas = await htmlToImage.toCanvas(sheetElement, attemptOptions);
-          break;
-        } catch (attemptErr) {
-          lastCaptureErr = attemptErr;
-          sourceCanvas = null;
-        }
-      }
-
-      if (!sourceCanvas) {
-        // Every normal attempt failed (typically a SecurityError from some
-        // cross-origin image that couldn't be neutralized). Rather than give
-        // up, try one final capture with all images stripped out entirely —
-        // this can never taint the canvas, so it should always succeed.
-        try {
-          sourceCanvas = await captureWithAllImagesStripped(sheetElement, 2);
-        } catch (finalErr) {
-          throw lastCaptureErr || finalErr || new Error('PDF capture failed after all retry attempts');
-        }
-      }
-
-      // Restore original transform
-      sheetElement.style.transform = originalTransform;
-      sheetElement.style.transformOrigin = originalTransformOrigin;
-
-      const pdf = new jsPDF({
-        orientation: 'portrait',
-        unit: 'mm',
-        format: 'a4',
-      });
-
-      const pdfPageWidth = 210;
-      const pdfPageHeight = 297;
-      const totalWidthPx = sourceCanvas.width;
-      const totalHeightPx = sourceCanvas.height;
-      const pxPerMm = totalWidthPx / pdfPageWidth;
-      const pageHeightPx = pdfPageHeight * pxPerMm;
-      const imgWidth = pdfPageWidth;
-
-      if (totalHeightPx <= pageHeightPx) {
-        // Fits on a single page — no cut needed.
-        const dataUrl = sourceCanvas.toDataURL('image/png');
-        const imgHeight = totalHeightPx / pxPerMm;
-        pdf.addImage(dataUrl, 'PNG', 0, 0, imgWidth, imgHeight, undefined, 'FAST');
-        pdf.save(fileName);
-        return true;
-      }
-
-      const ctx = sourceCanvas.getContext('2d');
-      if (!ctx) throw new Error('Could not read canvas context');
-      const imageData = ctx.getImageData(0, 0, totalWidthPx, totalHeightPx).data;
-
-      // A row counts as "safe to cut" if it's essentially blank (close to white),
-      // sampled sparsely across the width for speed.
-      const isRowBlank = (y: number): boolean => {
-        const rowStart = y * totalWidthPx * 4;
-        for (let x = 0; x < totalWidthPx; x += 8) {
-          const i = rowStart + x * 4;
-          const r = imageData[i], g = imageData[i + 1], b = imageData[i + 2];
-          if (r < 245 || g < 245 || b < 245) return false;
-        }
-        return true;
-      };
-
-      // Search up to ~12mm above the ideal cut line for a blank row, so we never
-      // slice through the middle of a line of text or a bullet point.
-      const maxSearchPx = 12 * pxPerMm;
-      const findCutY = (idealY: number): number => {
-        for (let dy = 0; dy <= maxSearchPx; dy++) {
-          const candidate = Math.round(idealY - dy);
-          if (candidate <= 0) break;
-          if (isRowBlank(candidate)) return candidate;
-        }
-        return Math.round(idealY); // fallback: hard cut if no whitespace found
-      };
-
-      const cutPoints: number[] = [0];
-      let cursor = 0;
-      while (totalHeightPx - cursor > pageHeightPx) {
-        const idealCut = cursor + pageHeightPx;
-        const cutY = findCutY(idealCut);
-        cutPoints.push(cutY > cursor ? cutY : Math.round(idealCut));
-        cursor = cutPoints[cutPoints.length - 1];
-      }
-      cutPoints.push(totalHeightPx);
-
-      const pageCanvas = document.createElement('canvas');
-      const pageCtx = pageCanvas.getContext('2d');
-      if (!pageCtx) throw new Error('Could not create page canvas context');
-
-      for (let p = 0; p < cutPoints.length - 1; p++) {
-        const sliceStart = cutPoints[p];
-        const sliceHeightPx = cutPoints[p + 1] - sliceStart;
-        pageCanvas.width = totalWidthPx;
-        pageCanvas.height = sliceHeightPx;
-        pageCtx.clearRect(0, 0, totalWidthPx, sliceHeightPx);
-        pageCtx.drawImage(
-          sourceCanvas,
-          0, sliceStart, totalWidthPx, sliceHeightPx,
-          0, 0, totalWidthPx, sliceHeightPx
-        );
-        const pageDataUrl = pageCanvas.toDataURL('image/png');
-        const sliceHeightMm = sliceHeightPx / pxPerMm;
-
-        if (p > 0) pdf.addPage();
-        pdf.addImage(pageDataUrl, 'PNG', 0, 0, imgWidth, sliceHeightMm, undefined, 'FAST');
-      }
-
-      pdf.save(fileName);
-      return true;
-    } catch (captureErr) {
-      console.warn('Direct image-based PDF generation encountered an issue:', captureErr);
-      // Ensure transform is restored in case of error
-      sheetElement.style.transform = originalTransform;
-      sheetElement.style.transformOrigin = originalTransformOrigin;
-      return false;
-    } finally {
-      // Always put the live preview's images back the way they were, whether
-      // capture succeeded or failed.
-      restoreImages?.();
-      restoreBackgrounds?.();
-    }
+  if (!sheetElement) {
+    // No capture target found on the page — nothing we can safely export.
+    const msg = `Could not find the resume preview on the page (selector "${elementSelector}" matched nothing).`;
+    console.warn('downloadDirectPdf:', msg);
+    return { success: false, error: msg };
   }
 
-  // No capture target found on the page — nothing we can safely export.
-  // We deliberately do NOT open a new tab or trigger the browser print dialog here;
-  // the caller can decide how to surface this (e.g. a small inline notice).
-  console.warn('downloadDirectPdf: could not find element to capture:', elementSelector);
-  return false;
+  // Save previous styles
+  const originalTransform = sheetElement.style.transform;
+  const originalTransformOrigin = sheetElement.style.transformOrigin;
+  let restoreImages: (() => void) | null = null;
+  let restoreBackgrounds: (() => void) | null = null;
 
+  try {
+    restoreImages = await neutralizeCrossOriginImages(sheetElement);
+    restoreBackgrounds = await neutralizeCrossOriginBackgrounds(sheetElement);
+
+    // Temporarily remove CSS zoom/scale transform so canvas captures unscaled 100% dimensions
+    sheetElement.style.transform = 'none';
+    sheetElement.style.transformOrigin = 'top left';
+
+    // Capture at high pixelRatio for crisp typography. We use toCanvas (not toPng)
+    // because we need raw pixel access to find safe places to cut between pages.
+    // Try a few progressively safer capture strategies: full-quality first (embeds
+    // Google Fonts + images), then a version that skips font embedding (common source
+    // of failures when the font CDN can't be reached), then a lower-resolution pass.
+    // This means a single flaky image/font never blocks the whole download.
+    let sourceCanvas: HTMLCanvasElement | null = null;
+    let lastCaptureErr: unknown = null;
+    const captureAttempts: Parameters<typeof htmlToImage.toCanvas>[1][] = [
+      { pixelRatio: 2, backgroundColor: '#ffffff', cacheBust: true },
+      { pixelRatio: 2, backgroundColor: '#ffffff', cacheBust: true, skipFonts: true, imagePlaceholder: '', onImageErrorHandler: () => {} },
+      { pixelRatio: 1, backgroundColor: '#ffffff', cacheBust: true, skipFonts: true, imagePlaceholder: '', onImageErrorHandler: () => {} },
+    ];
+
+    for (const attemptOptions of captureAttempts) {
+      try {
+        sourceCanvas = await htmlToImage.toCanvas(sheetElement, attemptOptions);
+        break;
+      } catch (attemptErr) {
+        lastCaptureErr = attemptErr;
+        sourceCanvas = null;
+      }
+    }
+
+    // Restore original transform
+    sheetElement.style.transform = originalTransform;
+    sheetElement.style.transformOrigin = originalTransformOrigin;
+
+    // IMPORTANT: htmlToImage.toCanvas() succeeding does NOT guarantee the
+    // canvas is safe to read from. A cross-origin image can still taint it
+    // silently — the SecurityError only fires later, the first time we call
+    // toDataURL()/getImageData() while assembling the PDF below. So we treat
+    // *that* failure, not just a thrown toCanvas(), as the trigger for the
+    // all-images-stripped fallback.
+    let lastBuildErr: unknown = lastCaptureErr;
+    if (sourceCanvas) {
+      try {
+        buildPdfFromCanvas(sourceCanvas, fileName);
+        return { success: true };
+      } catch (buildErr) {
+        lastBuildErr = buildErr;
+        console.warn('Normal PDF capture produced a tainted canvas, retrying with images stripped:', buildErr);
+      }
+    }
+
+    // Either capture itself failed on every attempt, or capture succeeded but
+    // the canvas turned out to be tainted when we tried to read it. Either
+    // way, fall back to a capture that can never be tainted because every
+    // image reference is removed from the DOM before it ever reaches the canvas.
+    try {
+      const strippedCanvas = await captureWithAllImagesStripped(sheetElement, 2);
+      buildPdfFromCanvas(strippedCanvas, fileName);
+      return { success: true };
+    } catch (finalErr) {
+      const rootCause = lastBuildErr ?? finalErr;
+      const message = rootCause instanceof Error ? rootCause.message : String(rootCause);
+      console.warn('Direct image-based PDF generation encountered an issue:', rootCause);
+      return { success: false, error: message };
+    }
+  } catch (captureErr) {
+    // Ensure transform is restored in case of error
+    sheetElement.style.transform = originalTransform;
+    sheetElement.style.transformOrigin = originalTransformOrigin;
+    const message = captureErr instanceof Error ? captureErr.message : String(captureErr);
+    console.warn('Direct image-based PDF generation encountered an issue:', captureErr);
+    return { success: false, error: message };
+  } finally {
+    // Always put the live preview's images back the way they were, whether
+    // capture succeeded or failed.
+    restoreImages?.();
+    restoreBackgrounds?.();
+  }
 }
 
 /**
