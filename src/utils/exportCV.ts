@@ -214,7 +214,13 @@ function buildPdfFromCanvas(sourceCanvas: HTMLCanvasElement, fileName: string): 
     cutPoints.push(cutY > cursor ? cutY : Math.round(idealCut));
     cursor = cutPoints[cutPoints.length - 1];
   }
-  cutPoints.push(totalHeightPx);
+  // Only add the final boundary if it isn't already the last cut point —
+  // otherwise the content ends exactly on a page break and we'd create a
+  // trailing zero-height "page", which produces an empty/invalid PNG and
+  // makes jsPDF throw "wrong PNG signature" when we try to add it.
+  if (cutPoints[cutPoints.length - 1] < totalHeightPx) {
+    cutPoints.push(totalHeightPx);
+  }
 
   const pageCanvas = document.createElement('canvas');
   const pageCtx = pageCanvas.getContext('2d');
@@ -223,6 +229,7 @@ function buildPdfFromCanvas(sourceCanvas: HTMLCanvasElement, fileName: string): 
   for (let p = 0; p < cutPoints.length - 1; p++) {
     const sliceStart = cutPoints[p];
     const sliceHeightPx = cutPoints[p + 1] - sliceStart;
+    if (sliceHeightPx <= 0) continue; // defensive: never rasterize a zero/negative-height slice
     pageCanvas.width = totalWidthPx;
     pageCanvas.height = sliceHeightPx;
     pageCtx.clearRect(0, 0, totalWidthPx, sliceHeightPx);
