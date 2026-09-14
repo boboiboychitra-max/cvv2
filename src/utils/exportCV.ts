@@ -57,6 +57,95 @@ async function neutralizeCrossOriginImages(root: HTMLElement): Promise<() => voi
 }
 
 /**
+ * Same problem as neutralizeCrossOriginImages, but for elements that set a
+ * cross-origin photo via a raw CSS `background-image: url(...)` instead of an
+ * <img> tag (e.g. a decorative sidebar photo). These are invisible to
+ * neutralizeCrossOriginImages (it only looks at <img> elements), so left
+ * alone they silently taint the canvas and make every capture attempt throw
+ * a SecurityError. We find them via computed style, inline the image as a
+ * base64 data URI the same way, and restore the original inline style after.
+ */
+async function neutralizeCrossOriginBackgrounds(root: HTMLElement): Promise<() => void> {
+  const all = [root, ...Array.from(root.querySelectorAll<HTMLElement>('*'))];
+  const urlPattern = /url\((['"]?)(https?:\/\/[^'")]+)\1\)/i;
+  const originals: { el: HTMLElement; style: string }[] = [];
+
+  await Promise.all(
+    all.map(async (el) => {
+      const bg = getComputedStyle(el).backgroundImage;
+      const match = bg && urlPattern.exec(bg);
+      if (!match) return;
+
+      const src = match[2];
+      originals.push({ el, style: el.style.backgroundImage });
+
+      try {
+        const res = await fetch(src, { mode: 'cors', cache: 'no-cache' });
+        const blob = await res.blob();
+        const dataUrl: string = await new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result as string);
+          reader.onerror = reject;
+          reader.readAsDataURL(blob);
+        });
+        // Preserve any gradient/etc. layered alongside the url(...) in the original value.
+        el.style.backgroundImage = bg.replace(match[0], `url('${dataUrl}')`);
+      } catch {
+        // Can't safely inline it — drop just the image layer so it doesn't taint the canvas.
+        el.style.backgroundImage = bg.replace(match[0], 'none');
+      }
+    })
+  );
+
+  return () => {
+    originals.forEach(({ el, style }) => {
+      el.style.backgroundImage = style;
+    });
+  };
+}
+
+/**
+ * Last-resort capture: strips every <img> src and CSS background-image down
+ * to nothing before capturing, so there is no possible cross-origin source
+ * left to taint the canvas. Used only if normal capture (with neutralized/
+ * inlined images) still fails for some unforeseen reason — it guarantees the
+ * user gets a PDF (text, layout and colors intact) instead of a hard failure,
+ * just without photos.
+ */
+async function captureWithAllImagesStripped(
+  sheetElement: HTMLElement,
+  pixelRatio: number
+): Promise<HTMLCanvasElement> {
+  const imgs = Array.from(sheetElement.querySelectorAll('img'));
+  const imgOriginals = imgs.map((img) => ({ el: img, src: img.getAttribute('src') || '' }));
+  imgs.forEach((img) => (img.src = BLANK_PIXEL));
+
+  const bgEls = [sheetElement, ...Array.from(sheetElement.querySelectorAll<HTMLElement>('*'))];
+  const urlPattern = /url\((['"]?)(https?:\/\/[^'")]+)\1\)/i;
+  const bgOriginals: { el: HTMLElement; style: string }[] = [];
+  bgEls.forEach((el) => {
+    const bg = getComputedStyle(el).backgroundImage;
+    const match = bg && urlPattern.exec(bg);
+    if (match) {
+      bgOriginals.push({ el, style: el.style.backgroundImage });
+      el.style.backgroundImage = bg.replace(match[0], 'none');
+    }
+  });
+
+  try {
+    return await htmlToImage.toCanvas(sheetElement, {
+      pixelRatio,
+      backgroundColor: '#ffffff',
+      cacheBust: true,
+      skipFonts: true,
+    });
+  } finally {
+    imgOriginals.forEach(({ el, src }) => (el.src = src));
+    bgOriginals.forEach(({ el, style }) => (el.style.backgroundImage = style));
+  }
+}
+
+/**
  * Downloads a high-resolution, pixel-perfect PDF file (.pdf)
  * by capturing the rendered CV template with html-to-image (supports OKLCH and modern CSS) and assembling via jsPDF.
  */
@@ -76,9 +165,11 @@ export async function downloadDirectPdf(
     const originalTransform = sheetElement.style.transform;
     const originalTransformOrigin = sheetElement.style.transformOrigin;
     let restoreImages: (() => void) | null = null;
+    let restoreBackgrounds: (() => void) | null = null;
 
     try {
       restoreImages = await neutralizeCrossOriginImages(sheetElement);
+      restoreBackgrounds = await neutralizeCrossOriginBackgrounds(sheetElement);
 
       // Temporarily remove CSS zoom/scale transform so canvas captures unscaled 100% dimensions
       sheetElement.style.transform = 'none';
@@ -110,7 +201,15 @@ export async function downloadDirectPdf(
       }
 
       if (!sourceCanvas) {
-        throw lastCaptureErr || new Error('PDF capture failed after all retry attempts');
+        // Every normal attempt failed (typically a SecurityError from some
+        // cross-origin image that couldn't be neutralized). Rather than give
+        // up, try one final capture with all images stripped out entirely —
+        // this can never taint the canvas, so it should always succeed.
+        try {
+          sourceCanvas = await captureWithAllImagesStripped(sheetElement, 2);
+        } catch (finalErr) {
+          throw lastCaptureErr || finalErr || new Error('PDF capture failed after all retry attempts');
+        }
       }
 
       // Restore original transform
@@ -212,6 +311,7 @@ export async function downloadDirectPdf(
       // Always put the live preview's images back the way they were, whether
       // capture succeeded or failed.
       restoreImages?.();
+      restoreBackgrounds?.();
     }
   }
 
